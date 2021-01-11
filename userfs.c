@@ -6,6 +6,7 @@
 
 #define MAX_FILE_SIZE PAGE_SIZE * 1000;
 #define USERFS_MAGIC 0x13371337
+#define USERFS_DIRS_OFFSET 512
 
 /* TODO: ATENTIE! DE ELIBERAT DENTRY-URILE ALOCATE?!!? */
 
@@ -77,7 +78,15 @@ static struct dentry *userfs_create_file(struct super_block *sb,
 {
 	struct inode *inode;
 	struct dentry *dentry;
+// 	struct qstr qname = QSTR_INIT(name, 5);
 	umode_t mode = S_IRUSR | S_IWUSR; /* TODO: DE SCHIMBAT PERMISIUNEA! */
+	
+// 	dentry = d_lookup(parent, &qname);
+// 	if (dentry)
+// 	{
+// 		pr_info("Am gasit deja %s\n", name);
+// 		return dentry;
+// 	}
 	
 	dentry = d_alloc_name(parent, name);
 	if (!dentry)
@@ -108,7 +117,15 @@ static struct dentry *userfs_create_dir(struct super_block *sb,
 {
 	struct inode *inode;
 	struct dentry *dentry;
+	//struct qstr qname = QSTR_INIT(name, 4);/* HARDCODAREEEEEE */
 	umode_t mode = S_IFDIR | S_IRWXU; /* TODO: DE SCHIMBAT PERMISIUNEA! */
+	
+// 	dentry = d_lookup(parent, &qname);
+// 	if (dentry)
+// 	{
+// 		pr_info("Am gasit deja %s\n", name);
+// 		return dentry;
+// 	}
 	
 	dentry = d_alloc_name(parent, name); /* Aloca o intrare dentry */
 	if (!dentry)
@@ -137,18 +154,34 @@ static struct dentry *userfs_create_dir(struct super_block *sb,
 
 
 /* Creeaza directoarele pentru fiecare user si cate un fisier procs corespunzator */
-static int userfs_create_dirs(struct super_block *sb, struct dentry *root)
+static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 {
+	/* TODO: ATENTIE LA CONDITIILE DE CURSA! */
+	/* TODO: MOMENTAN MERGE, DAR E CAM INEFICIENT(SE ALOCA MEMORIE IN PROSTIE!), DE MEMORY LEAK-URI NICI NU MAI VORBIM..*/
+	/* TODO: STERGEREA DIRECTOARELOR PT USERI INACTIVI(oare ar trebui sa eliberez toate dentry-urile, asemanator cu proc?) */
+	
+	struct super_block *sb = file_inode(file)->i_sb;
+	struct dentry *root = sb->s_root;
 	int no_users = 3;
 	int i;
-
+	
+	pr_info("Am intrat in root readdir\n");
+	
+	if (ctx->pos > USERFS_DIRS_OFFSET)
+		return 0; /* nu mai avem ce citi */
+		
+	if (!dir_emit_dots(file, ctx)) /* trecem peste '.' si '..' */
+		return 0;
+	
 	for (i = 0; i < no_users; i++)
 	{
 		struct dentry *dentry;
 		struct dentry *dentry_procs;
+		struct inode  *inode;
 		char name[20]; /* TODO:  de schimbat aici */
+		int len;
 		
-		snprintf(name, sizeof(name), "dir%d", i);
+		len = snprintf(name, sizeof(name), "dir%d", i);
 		dentry = userfs_create_dir(sb, root, name);
 		
 		if (!dentry)
@@ -157,13 +190,21 @@ static int userfs_create_dirs(struct super_block *sb, struct dentry *root)
 			return -1; /* sau errno.. */
 		}
 		
+		inode = d_inode(dentry);
+		
 		dentry_procs = userfs_create_file(sb, dentry, "procs");
 		if (!dentry_procs)
 		{
 			pr_err("Eroare creare fisier procs!\n");
 			return -1; /* sau errno! */
 		}
+		
+		ctx->pos += 1;
+		dir_emit(ctx, name, len, inode->i_ino, inode->i_mode >> 12);
+		
 	}
+	
+	ctx->pos = USERFS_DIRS_OFFSET + 1;
 	
 	return 0;
 }
@@ -175,6 +216,13 @@ const struct super_operations userfs_sb_ops =
 	.drop_inode = generic_delete_inode  /* Se apeleaza la stergerea unui inod */
 	
 	/* TODO: show_options */
+};
+
+static const struct file_operations userfs_root_ops =
+{
+	.read = generic_read_dir,
+	.iterate = userfs_root_readdir,
+	.llseek = generic_file_llseek
 };
 
 
@@ -191,7 +239,7 @@ int userfs_fill_sb(struct super_block *sb, void *data, int silent)
 	sb->s_magic          = USERFS_MAGIC;   /* Indentificatorul sistemului de fisiere */
 	
 	inode = userfs_new_inode(sb, S_IFDIR | S_IRWXU); /* Creeaza un nou inod. TODO: ATENTIE! DE SCHIMBAT PERMISIUNEA! */ 
-	inode->i_fop = &simple_dir_operations; //&userfs_rootdir_ops;
+	inode->i_fop = &userfs_root_ops; //&userfs_root_ops;
 	inode->i_op = &simple_dir_inode_operations;
 	sb->s_root = d_make_root(inode);                 /* Fa-l radacina. */
 	
@@ -202,7 +250,7 @@ int userfs_fill_sb(struct super_block *sb, void *data, int silent)
 		return -1;
 	}
 
-	return userfs_create_dirs(sb, sb->s_root); /* Populeaza cu directoare si fisiere */
+	return 0;
 }
 
 
