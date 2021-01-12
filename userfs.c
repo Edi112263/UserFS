@@ -4,11 +4,13 @@
 #include <linux/kernel.h>
 #include <linux/pagemap.h>
 #include <linux/random.h>
+#include <linux/slab.h>
 
-#define MAX_FILE_SIZE PAGE_SIZE * 1000;
+#define MAX_FILE_SIZE PAGE_SIZE * 1024;
 #define USERFS_MAGIC 0x13371337
 #define USERFS_DIRS_OFFSET 1024
 #define MAX_USERS 512
+#define MAX_OUTPUT_SIZE 4096
 
 static int tura;
 static int ture[MAX_USERS]; // poate ar merge mai bine un malloc la userfs_init?
@@ -40,23 +42,51 @@ struct inode *userfs_new_inode(struct super_block *sb, umode_t mode)
 static ssize_t userfs_file_read (struct file *file, char *usrbuf, 
 			size_t count, loff_t *offset)
 {
-	char mesaj[] = "Te salut, utilizatorule!\n";
-	static int completed = 0; /* TODO: Atentie la acest static, persista in mai multe instante ale userfs */
+	char *msg = kmalloc(MAX_OUTPUT_SIZE, GFP_KERNEL);
+	int bytes;
+	struct task_struct *task;
+	struct dentry *parent = file_dentry(file)->d_parent;
+	long test;
+	kuid_t task_uid, uid;
+	int procs = 0;
+	ssize_t len = min(count, MAX_OUTPUT_SIZE - *offset);
 	
-	if (completed)
+	if (len <= 0)
 		return 0;
 	
-	pr_info("Se citeste dintr-un fisier!\n");
+	if (kstrtol(parent->d_iname, 10, &test) != 0)
+		test = 0;
+	uid = KUIDT_INIT(test);
+
+	rcu_read_lock();
+	for_each_process(task)
+	{
+		task_lock(task);
+		
+		task_uid = task->cred->uid;
+		if (uid_eq(uid, task_uid))
+			procs++;
+		
+		task_unlock(task);
+	}
+	rcu_read_unlock();
 	
-	if (count > sizeof(mesaj))
-		count = sizeof(mesaj);
 	
-	if (copy_to_user(usrbuf, mesaj, count) != 0)
+	if (procs > 0)
+		bytes = snprintf(msg, MAX_OUTPUT_SIZE, "Numarul de procese ale utilizatorului %u: %d\n", uid.val, procs);
+	else
+		bytes = snprintf(msg, MAX_OUTPUT_SIZE, "Utilizatorul %u nu are lansat niciun proces!\n", uid.val);
+	
+	if (*offset > bytes)
+		return 0;
+		
+	if (copy_to_user(usrbuf, msg + *offset, len) != 0)
 		return -1; /* mai degraba errno.. */
 	
-	completed = 1;
+	kfree(msg);
 	
-	return count;
+	*offset += len;
+	return len;
 }
 
 /* Functia care se apeleaza la fiecare deschidere a unui fisier(procs) */
@@ -85,7 +115,7 @@ int userfs_create_file(struct super_block *sb,
 	struct inode *inode;
 	struct dentry *dentry;
 	struct qstr qname = QSTR_INIT(name, len);
-	umode_t mode = S_IRUSR | S_IWUSR; /* TODO: DE SCHIMBAT PERMISIUNEA! */
+	umode_t mode = S_IWUSR | S_IRUGO;
 	
 	dentry = d_hash_and_lookup(parent, &qname); // se mareste ref count
 	if (dentry && dentry->d_inode)
@@ -123,7 +153,7 @@ int userfs_create_dir(struct super_block *sb, struct dentry *parent,
 	struct inode *inode;
 	struct dentry *dentry;
 	struct qstr qname = QSTR_INIT(name, len);
-	umode_t mode = S_IFDIR | S_IRWXU; /* TODO: DE SCHIMBAT PERMISIUNEA! */
+	umode_t mode = S_IFDIR | S_IXUGO | S_IWUSR | S_IRUGO; 
 	
 	dentry = d_hash_and_lookup(parent, &qname); // se mareste ref count
 	if (dentry && dentry->d_inode)
@@ -222,29 +252,7 @@ static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 		
 		userfs_create_dir(sb, root, ctx, name, len); // de verificat si aici eroare
 		
-		
-		//if (userfs_create_dir(sb, root, ctx, name, len) == 0)
-		//	userfs_create_file(sb, root, name, len);
-		
-		
-// 		if (!dentry)
-// 		{
-// 			pr_err("Eroare creare dir!\n");
-// 			return -1; /* sau errno.. */
-// 		}
-// 		
-// 		inode = d_inode(dentry); /* Inodul corespunzator dentry-ului */
-		
-// 		dentry_procs = userfs_create_file(sb, dentry, "procs", len);
-// 		if (!dentry_procs)
-// 		{
-// 			pr_err("Eroare creare fisier procs!\n");
-// 			return -1; /* sau errno! */
-// 		}
-		
-// 		ctx->pos += 1;
-// 		//dput(dentry);
-// 		dir_emit(ctx, name, len, inode->i_ino, inode->i_mode >> 12); /* TODO: de verificat daca bufferul userului e plin */
+		/* TODO: de verificat daca bufferul userului e plin */
 		
 	}
 	rcu_read_unlock();
@@ -285,7 +293,7 @@ int userfs_fill_sb(struct super_block *sb, void *data, int silent)
 	sb->s_op             = &userfs_sb_ops; /* Operatii pe superblock */
 	sb->s_magic          = USERFS_MAGIC;   /* Indentificatorul sistemului de fisiere */
 	
-	inode = userfs_new_inode(sb, S_IFDIR | S_IRWXU); /* Creeaza un nou inod. TODO: ATENTIE! DE SCHIMBAT PERMISIUNEA! */ 
+	inode = userfs_new_inode(sb, S_IFDIR | S_IXUGO | S_IWUSR | S_IRUGO); /* Creeaza un nou inod. */
 	inode->i_fop = &userfs_root_ops; //&userfs_root_ops;
 	inode->i_op = &simple_dir_inode_operations;
 	sb->s_root = d_make_root(inode);                 /* Fa-l radacina. */
