@@ -3,10 +3,16 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/pagemap.h>
+#include <linux/random.h>
 
 #define MAX_FILE_SIZE PAGE_SIZE * 1000;
 #define USERFS_MAGIC 0x13371337
-#define USERFS_DIRS_OFFSET 512
+#define USERFS_DIRS_OFFSET 1024
+#define MAX_USERS 512
+
+static int tura;
+static int ture[MAX_USERS]; // poate ar merge mai bine un malloc la userfs_init?
+static int n;
 
 /* TODO: ATENTIE! DE ELIBERAT DENTRY-URILE ALOCATE?!!? */
 
@@ -73,61 +79,22 @@ static const struct file_operations userfs_file_ops =
 /* Creeaza un fisier si asociaza-i o intrare de tip dentry.
  * Foarte asemanatoare cu crearea unui director(userfs_create_dir).
  */
-static struct dentry *userfs_create_file(struct super_block *sb,
-			struct dentry *parent, char *name)
+int userfs_create_file(struct super_block *sb,
+			struct dentry *parent, char *name, int len)
 {
 	struct inode *inode;
 	struct dentry *dentry;
-// 	struct qstr qname = QSTR_INIT(name, 5);
+	struct qstr qname = QSTR_INIT(name, len);
 	umode_t mode = S_IRUSR | S_IWUSR; /* TODO: DE SCHIMBAT PERMISIUNEA! */
 	
-// 	dentry = d_lookup(parent, &qname);
-// 	if (dentry)
-// 	{
-// 		pr_info("Am gasit deja %s\n", name);
-// 		return dentry;
-// 	}
-	
-	dentry = d_alloc_name(parent, name);
-	if (!dentry)
-		goto err;
-	
-	inode = userfs_new_inode(sb, mode);
-	if (!inode)
-		goto err_free;
-	
-	/* Fisierului i se asociaza alte operatii I/O decat cele ale unui director */
-	inode->i_fop = &userfs_file_ops; 
-		
-	d_add(dentry, inode);
-	
-	return dentry;
-	
-	err_free:
+	dentry = d_hash_and_lookup(parent, &qname); // se mareste ref count
+	if (dentry && dentry->d_inode)
+	{
 		dput(dentry);
-	err:
-		return NULL;
-}
-
-/* Creeaza un director si asociaza-i o intrare de tip dentry.
- * Intrarile de tip dentry sunt folosite de kernel pentru parsarea cailor(path-urilor). 
- */
-static struct dentry *userfs_create_dir(struct super_block *sb, 
-			struct dentry *parent, char *name)
-{
-	struct inode *inode;
-	struct dentry *dentry;
-	//struct qstr qname = QSTR_INIT(name, 4);/* HARDCODAREEEEEE */
-	umode_t mode = S_IFDIR | S_IRWXU; /* TODO: DE SCHIMBAT PERMISIUNEA! */
+		return 0;
+	}
 	
-// 	dentry = d_lookup(parent, &qname);
-// 	if (dentry)
-// 	{
-// 		pr_info("Am gasit deja %s\n", name);
-// 		return dentry;
-// 	}
-	
-	dentry = d_alloc_name(parent, name); /* Aloca o intrare dentry */
+	dentry = d_alloc(parent, &qname); /* Aloca o intrare dentry */
 	if (!dentry)
 		goto err;
 	
@@ -135,21 +102,85 @@ static struct dentry *userfs_create_dir(struct super_block *sb,
 	if (!inode)
 		goto err_free;
 	
-	inode->i_fop = &simple_dir_operations; // &userfs_dir_ops
+	inode->i_fop = &userfs_file_ops;
 	
-	/* Intrucat nu implementam operatii pe directoare(cum ar fi mkdir, rmdir)
-	 * este suficient nu definim aceste operatii.
-	 */
-	inode->i_op  = &simple_dir_inode_operations; 
-		
 	d_add(dentry, inode); /* Adauga dentry-ul directorului creat in evidenta sistemului de operare */
-	
-	return dentry;
+
+	return 0;
 	
 	err_free:
-		dput(dentry); /* Elibereaza intrarea daca am intampinat o eroare */
+		dput(dentry);//d_drop(dentry); /* Elibereaza intrarea daca am intampinat o eroare */
 	err:
-		return NULL;
+		return -1;
+}
+
+/* Creeaza un director si asociaza-i o intrare de tip dentry.
+ * Intrarile de tip dentry sunt folosite de kernel pentru parsarea cailor(path-urilor). 
+ */
+int userfs_create_dir(struct super_block *sb, struct dentry *parent,
+			struct dir_context *ctx, char *name, int len)
+{
+	struct inode *inode;
+	struct dentry *dentry;
+	struct qstr qname = QSTR_INIT(name, len);
+	umode_t mode = S_IFDIR | S_IRWXU; /* TODO: DE SCHIMBAT PERMISIUNEA! */
+	
+	dentry = d_hash_and_lookup(parent, &qname); // se mareste ref count
+	if (dentry && dentry->d_inode)
+	{
+		int *fsdata = dentry->d_fsdata;
+		
+		if (*fsdata == tura) // am afisat deja directorul
+		{
+			pr_info("Am gasit deja tura asta: nr %d, nume: %s\n", tura, name);
+			dput(dentry);
+			return 0;
+		}
+		
+		pr_info("Prima oara pe tura asta: nr %d, nume: %s\n", tura, name);
+		*fsdata = tura; // marcheaza ca am afisat tura asta
+		inode = dentry->d_inode;
+		dput(dentry); // daca buubuie, scioate-ioo
+	}
+	else
+	{
+		pr_info("Nu am gasit %s\n", name);
+		
+		
+		dentry = d_alloc(parent, &qname); /* Aloca o intrare dentry */
+		if (!dentry)
+			goto err;
+		
+		inode = userfs_new_inode(sb, mode); /* Aloca un nou inod */
+		if (!inode)
+			goto err_free;
+		
+		ture[n] = tura; // atentie la conditii de cursa....
+		dentry->d_fsdata = &ture[n];
+		n = (n + 1) % MAX_USERS;
+		
+		inode->i_fop = &simple_dir_operations; // &userfs_dir_ops
+		
+		/* Intrucat nu implementam operatii pe directoare(cum ar fi mkdir, rmdir)
+		* este suficient nu definim aceste operatii.
+		*/
+		inode->i_op  = &simple_dir_inode_operations; 
+		d_add(dentry, inode); /* Adauga dentry-ul directorului creat in evidenta sistemului de operare */
+		
+		if (userfs_create_file(sb, dentry, "procs", 5) != 0)
+			goto err_free;
+	}
+	
+	
+	ctx->pos += 1;
+	//d_drop(dentry);
+	//dput(dentry);
+	return dir_emit(ctx, name, len, inode->i_ino, inode->i_mode >> 12); // fill info
+	
+	err_free:
+		dput(dentry);//d_drop(dentry); /* Elibereaza intrarea daca am intampinat o eroare */
+	err:
+		return -1;
 }
 
 
@@ -162,9 +193,9 @@ static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 	
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct dentry *root = sb->s_root;
-	int no_users = 3;
-	int i;
-	
+	struct task_struct *task;
+	kuid_t uid;
+
 	pr_info("Am intrat in root readdir\n");
 	
 	if (ctx->pos > USERFS_DIRS_OFFSET)
@@ -173,38 +204,54 @@ static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 	if (!dir_emit_dots(file, ctx)) /* trecem peste '.' si '..' */
 		return 0;
 	
-	for (i = 0; i < no_users; i++)
+	rcu_read_lock();
+	// preia lacat si pentru tura!
+	for_each_process(task)
 	{
-		struct dentry *dentry;
-		struct dentry *dentry_procs;
-		struct inode  *inode;
+// 		struct dentry *dentry;
+// 		struct dentry *dentry_procs;
+// 		struct inode  *inode;
 		char name[20]; /* TODO:  de schimbat aici */
 		int len;
 		
-		len = snprintf(name, sizeof(name), "dir%d", i);
-		dentry = userfs_create_dir(sb, root, name);
+		task_lock(task);
+		uid = task->cred->uid; /* Preia id-ul utilizatorului */
+		task_unlock(task);
 		
-		if (!dentry)
-		{
-			pr_err("Eroare creare dir!\n");
-			return -1; /* sau errno.. */
-		}
+		len = snprintf(name, sizeof(name), "%u", uid.val);
 		
-		inode = d_inode(dentry);
+		userfs_create_dir(sb, root, ctx, name, len); // de verificat si aici eroare
 		
-		dentry_procs = userfs_create_file(sb, dentry, "procs");
-		if (!dentry_procs)
-		{
-			pr_err("Eroare creare fisier procs!\n");
-			return -1; /* sau errno! */
-		}
 		
-		ctx->pos += 1;
-		dir_emit(ctx, name, len, inode->i_ino, inode->i_mode >> 12);
+		//if (userfs_create_dir(sb, root, ctx, name, len) == 0)
+		//	userfs_create_file(sb, root, name, len);
+		
+		
+// 		if (!dentry)
+// 		{
+// 			pr_err("Eroare creare dir!\n");
+// 			return -1; /* sau errno.. */
+// 		}
+// 		
+// 		inode = d_inode(dentry); /* Inodul corespunzator dentry-ului */
+		
+// 		dentry_procs = userfs_create_file(sb, dentry, "procs", len);
+// 		if (!dentry_procs)
+// 		{
+// 			pr_err("Eroare creare fisier procs!\n");
+// 			return -1; /* sau errno! */
+// 		}
+		
+// 		ctx->pos += 1;
+// 		//dput(dentry);
+// 		dir_emit(ctx, name, len, inode->i_ino, inode->i_mode >> 12); /* TODO: de verificat daca bufferul userului e plin */
 		
 	}
+	rcu_read_unlock();
+	// cedeaza lacatul si pentru tura!
 	
 	ctx->pos = USERFS_DIRS_OFFSET + 1;
+	tura++;
 	
 	return 0;
 }
@@ -274,7 +321,7 @@ static struct file_system_type userfs_type =
 	.name = "userfs", /* Numele sistemului de fisiere care se va folosi la montarea cu 'mount -t' */
 	.owner = THIS_MODULE,
 	.mount = userfs_mount, /* Functia care se va apela la montare */
-	.kill_sb = kill_litter_super /* Functie a sistemului de operare care se va apela la demontare
+	.kill_sb = kill_anon_super /* Functie a sistemului de operare care se va apela la demontare
 									pentru a elibera structurile interne. */
 };
 
