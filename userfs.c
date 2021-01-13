@@ -5,6 +5,8 @@
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/err.h>
+#include <linux/string.h>
+#include <linux/types.h>
 
 #define USERFS_MAGIC 0x13371337
 #define USERFS_DIRS_OFFSET 1024
@@ -18,6 +20,108 @@ static long ture[MAX_USERS]; // poate ar merge mai bine un malloc la userfs_init
 static int n;
 
 
+static int get_username(kuid_t uid, char *name, int size) // de schimbat *uid in uid!!!!!
+{
+	struct file *f;
+	char buf[24]; // de schimbat!!
+	loff_t pos = 0;
+	long l_uid;
+	kuid_t uid_passwd;
+	ssize_t bytes = 0;
+	char *it;
+	char username[32 + 1]; // 32 e marimea maxima a numelui unui utilizator
+	char str_uid[8];
+	int cnt = 0;
+	bool ok_nume = 0, ok_pass = 0, ok_uid = 0; // 0 - nu am terminat de citit, 1 - am citit
+	
+	if (!name)
+		return -1;
+	
+	f = filp_open("/etc/passwd", O_RDONLY, 0);
+	if (!f)
+	{
+		pr_err("Eroare deschidere /etc/passwd!\n");
+		goto err;
+	}
+	
+	while ((bytes = kernel_read(f, buf, sizeof(buf) - 1, &pos)) > 0 )
+	{
+		buf[bytes] = '\0';
+		it = buf;
+		
+		if (ok_uid) // daca am terminat de citit uid-ul
+		{
+			it = strchr(it, '\n'); // trecem la urmatoarea linie din fisier
+			if (!it)
+				continue; 
+			
+			it++; // trecem de '\n'
+			ok_nume = ok_pass = ok_uid = 0; // resetem ok-urile
+			cnt = 0; // si contorul
+		} 
+		
+		if (!ok_nume) // daca nu am terminat de citit numele
+		{
+			for (; *it != ':' && *it != '\0'; cnt++, it++)
+				username[cnt] = *it;
+			
+			username[cnt] = '\0';
+			if (*it == '\0') // nu mai avem ce citi tura asta
+				continue;
+			
+			ok_nume = 1; // altfel, am dat de ':', deci am terminat de citit numele
+			it++;
+			cnt = 0;
+		}
+		
+		if (!ok_pass)
+		{
+			for (; *it != ':' && *it != '\0'; cnt++, it++); // sarim peste parola
+			
+			if (*it == '\0') // nu mai avem ce citi tura asta
+				continue;
+			
+			ok_pass = 1;
+			it++;
+			cnt = 0;
+		}
+		
+		if (!ok_uid)
+		{
+			for (; *it != ':' && *it != '\0'; cnt++, it++)
+				str_uid[cnt] = *it;
+				
+			str_uid[cnt] = '\0';
+			if (*it == '\0') // nu mai avem ce citi tura asta
+				continue;
+			
+			ok_uid = 1; // am terminat de citit si uid-ul
+			if (kstrtol(str_uid, 10, &l_uid) != 0)
+			{
+				pr_err("Eroare parsare uid passwd!\n");
+				return -1;
+			}
+			uid_passwd = KUIDT_INIT(l_uid);
+			
+			if (!uid_eq(uid_passwd, uid))
+				continue;
+			
+			strncpy(name, username, size);
+			name[size] = '\0';
+			goto done;
+		}
+	}
+	// daca am ajuns pana aici, inseamna ca nu am gasit nimic..	
+	
+err:
+	filp_close(f, NULL);
+	return -1;
+	
+done:
+	filp_close(f, NULL);
+	return 0;
+}
+
 /* Functie care creaza un nou inod si il initializeaza cu valori implicite */
 struct inode *userfs_new_inode(struct super_block *sb, umode_t mode)
 {
@@ -26,7 +130,7 @@ struct inode *userfs_new_inode(struct super_block *sb, umode_t mode)
 	if (inode)
 	{
 		inode->i_mode = mode; /* Permisiuni */
-		inode->i_blocks = 0; /* Numarul de blocuri(initial nu avem niciun bloc cu date) */
+		inode->i_blocks = 0; /* Numarul de blocuri(nu avem niciun bloc cu date) */
 		inode->i_blkbits = inode->i_sb->s_blocksize_bits; /* Marimea unui block in biti(aceeasi ca a superblock-ului) */
 		inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode); /* Timpul trunchiat la granularitatea fs-ului */
 // 		inode->i_uid = inode->i_gid = 0;
@@ -257,6 +361,7 @@ static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 // 		struct dentry *dentry_procs;
 // 		struct inode  *inode;
 		char name[20]; /* TODO:  de schimbat aici */
+		char username[31];
 		int len;
 		
 		task_lock(task);
@@ -264,6 +369,10 @@ static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 		task_unlock(task);
 		
 		len = snprintf(name, sizeof(name), "%u", uid.val);
+		if (!get_username(uid, username, sizeof(username)))
+			pr_info("UID: %u, Nume: %s\n", uid.val, username);
+		else
+			pr_err("Eroare aflare nume UID: %u\n", uid.val);
 		
 		userfs_create_dir(sb, root, ctx, name, len); // de verificat si aici eroare
 		
