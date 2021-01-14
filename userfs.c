@@ -7,6 +7,7 @@
 #include <linux/err.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/mutex.h>
 
 #define USERFS_MAGIC 0x13371337
 #define USERFS_DIRS_OFFSET 1024
@@ -15,15 +16,17 @@
 #define COLOR_GREEN   "\x1b[32m"
 #define COLOR_RESET   "\x1b[0m"
 
+DEFINE_MUTEX(userfs_mutex_tura);
+
 static long tura; /* TODO: de schimbat denumirea variabilei! */
 static long ture[MAX_USERS]; // poate ar merge mai bine un malloc la userfs_init?
 static int n;
 
 
-static int get_username(kuid_t uid, char *name, int size) // de schimbat *uid in uid!!!!!
+static int get_username(kuid_t uid, char *name, int size)
 {
 	struct file *f;
-	char buf[24]; // de schimbat!!
+	char buf[24]; // de verificat de ce nu merge cu 128!
 	loff_t pos = 0;
 	long l_uid;
 	kuid_t uid_passwd;
@@ -99,7 +102,7 @@ static int get_username(kuid_t uid, char *name, int size) // de schimbat *uid in
 			if (kstrtol(str_uid, 10, &l_uid) != 0)
 			{
 				pr_err("Eroare parsare uid passwd!\n");
-				return -1;
+				goto err;
 			}
 			uid_passwd = KUIDT_INIT(l_uid);
 			
@@ -150,18 +153,12 @@ static ssize_t userfs_file_read (struct file *file, char *usrbuf,
 	int bytes = 0;
 	struct task_struct *task;
 	struct dentry *parent = file_dentry(file)->d_parent;
-	long l_uid;
-	kuid_t uid;
+	char *username = parent->d_iname;
 	long dif = MAX_OUTPUT_SIZE - *offset;
-	//int procs = 0;
 	ssize_t len = (count < dif) ? count : dif;
 	
 	if (len <= 0)
 		return 0;
-	
-	if (kstrtol(parent->d_iname, 10, &l_uid) != 0)
-		return 0; // EOF
-	uid = KUIDT_INIT(l_uid);
 	
 	bytes += snprintf(msg, MAX_OUTPUT_SIZE, COLOR_GREEN "%s\n" COLOR_RESET, heading);
 	
@@ -169,20 +166,29 @@ static ssize_t userfs_file_read (struct file *file, char *usrbuf,
 	for_each_process(task)
 	{
 		kuid_t task_uid;
+		char task_username[33];
 		
 		task_lock(task);
 		task_uid = task->cred->uid;
-		if (uid_eq(uid, task_uid))
+		
+		if (!get_username(task_uid, task_username, sizeof(username)))
 		{
-			//procs++;
-			if (bytes >= MAX_OUTPUT_SIZE)
+			if (!strcmp(task_username, username))
 			{
-				task_unlock(task);
-				break;
+				if (bytes >= MAX_OUTPUT_SIZE)
+				{
+					task_unlock(task);
+					break;
+				}
+				bytes += snprintf(msg + bytes, MAX_OUTPUT_SIZE - bytes, 
+								"%-7d %s\n", (int) task_pid_nr(task), task->comm);
 			}
-			bytes += snprintf(msg + bytes, MAX_OUTPUT_SIZE - bytes, 
-							  "%-7d %s\n", (int) task_pid_nr(task), task->comm);
 		}
+		else
+		{
+			pr_err("Eroare aflare nume UID: %u\n", task_uid.val);
+		}
+		
 		task_unlock(task);
 		
 	}
@@ -250,9 +256,12 @@ int userfs_create_file(struct super_block *sb,
 		return 0;
 	}
 	
-	dentry = d_alloc(parent, &qname); /* Aloca o intrare dentry */
 	if (!dentry)
-		goto err;
+	{
+		dentry = d_alloc(parent, &qname); /* Aloca o intrare dentry */
+		if (!dentry)
+			goto err;
+	}
 	
 	dentry->d_op = &userfs_dentry_ops;
 	inode = userfs_new_inode(sb, mode); /* Aloca un nou inod */
@@ -308,12 +317,14 @@ int userfs_create_dir(struct super_block *sb, struct dentry *parent,
 		dentry = d_alloc(parent, &qname); /* Aloca o intrare dentry */
 		if (!dentry)
 			goto err;
-	}	
+	}
+	
+	dentry->d_op = &userfs_dentry_ops;
 	inode = userfs_new_inode(sb, mode); /* Aloca un nou inod */
 	if (!inode)
 		goto err_free;
 	
-	ture[n] = tura; // atentie la conditii de cursa....
+	ture[n] = tura; // am preluat lacatul din readdir
 	dentry->d_fsdata = &ture[n];
 	n = (n + 1) % MAX_USERS;
 	
@@ -340,12 +351,10 @@ static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 {
 	/* TODO: ATENTIE LA CONDITIILE DE CURSA! */
 	/* TODO: MOMENTAN MERGE, DAR E CAM INEFICIENT(SE ALOCA MEMORIE IN PROSTIE!), DE MEMORY LEAK-URI NICI NU MAI VORBIM..*/
-	/* TODO: STERGEREA DIRECTOARELOR PT USERI INACTIVI(oare ar trebui sa eliberez toate dentry-urile, asemanator cu proc?) */
 	
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct dentry *root = sb->s_root;
 	struct task_struct *task;
-	kuid_t uid;
 	
 	if (ctx->pos > USERFS_DIRS_OFFSET)
 		return 0; /* nu mai avem ce citi */
@@ -353,98 +362,92 @@ static int userfs_root_readdir(struct file *file, struct dir_context *ctx)
 	if (!dir_emit_dots(file, ctx)) /* trecem peste '.' si '..' */
 		return 0;
 	
+	mutex_lock(&userfs_mutex_tura);
 	rcu_read_lock();
-	// preia lacat si pentru tura!
 	for_each_process(task)
 	{
-// 		struct dentry *dentry;
-// 		struct dentry *dentry_procs;
-// 		struct inode  *inode;
-		char name[20]; /* TODO:  de schimbat aici */
-		char username[31];
+		//char name[20]; /* TODO:  de schimbat aici */
+		char username[33];
 		int len;
+		kuid_t uid;
 		
 		task_lock(task);
 		uid = task->cred->uid; /* Preia id-ul utilizatorului */
 		task_unlock(task);
 		
-		len = snprintf(name, sizeof(name), "%u", uid.val);
+		get_username(uid, username, sizeof(username));
+		//len = snprintf(name, sizeof(name), "%u", uid.val);
 		if (!get_username(uid, username, sizeof(username)))
-			pr_info("UID: %u, Nume: %s\n", uid.val, username);
+		{
+			len = strlen(username);
+			userfs_create_dir(sb, root, ctx, username, len); // de verificat si aici eroare
+		}
 		else
+		{
 			pr_err("Eroare aflare nume UID: %u\n", uid.val);
-		
-		userfs_create_dir(sb, root, ctx, name, len); // de verificat si aici eroare
-		
-		/* TODO: de verificat daca bufferul userului e plin */
-		
+		}
 	}
 	rcu_read_unlock();
-	// cedeaza lacatul si pentru tura!
+	tura++;
+	mutex_unlock(&userfs_mutex_tura);
 	
 	ctx->pos = USERFS_DIRS_OFFSET + 1;
-	tura++;
-	
 	return 0;
 }
 
 static struct dentry *userfs_root_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
 	struct task_struct *task;
-	const unsigned char *name = dentry->d_name.name;
-	long   l_uid;
-	kuid_t uid;
-	
-	if (kstrtol(name, 10, &l_uid) != 0)
-		goto not_found;
-	uid = KUIDT_INIT(l_uid);
-	
-	if (dentry->d_inode)
-	{
-		pr_info("Lookup %s: valid dentry.\n", name);
-	}
-	else
-		pr_info("Lookup %s: invalid dentry.\n", name);
-	
-	//return simple_lookup(dir, dentry, flags);
+	const char *username = dentry->d_iname;
 	
 	rcu_read_lock();
 	for_each_process(task)
 	{
+		char task_username[33];
 		kuid_t task_uid;
 		
 		task_lock(task);
 		task_uid = task->cred->uid; /* Preia id-ul utilizatorului */
 		task_unlock(task);
 		
-		if (uid_eq(uid, task_uid))
+		if (!get_username(task_uid, task_username, sizeof(username)))
 		{
-			umode_t mode = S_IFDIR | S_IXUGO | S_IRUGO;
-			struct inode *inode = userfs_new_inode(dir->i_sb, mode);
-			
-			if (!inode)
+			if (!strcmp(task_username, username))
 			{
-				pr_err("Eroare alocare inod lookup\n");
-				return ERR_PTR(-1);
+				umode_t mode = S_IFDIR | S_IXUGO | S_IRUGO;
+				struct inode *inode = userfs_new_inode(dir->i_sb, mode);
+				
+				if (!inode)
+				{
+					pr_err("Eroare alocare inod lookup\n");
+					return ERR_PTR(-1);
+				}
+				
+				dentry->d_op = &userfs_dentry_ops;
+				inode->i_fop = &simple_dir_operations;
+				inode->i_op = &simple_dir_inode_operations;
+				
+				mutex_lock(&userfs_mutex_tura);
+				dentry->d_fsdata = &ture[n];
+				n = (n + 1) % MAX_USERS;
+				mutex_unlock(&userfs_mutex_tura);
+				
+				d_add(dentry, inode);
+				userfs_create_file(dir->i_sb, dentry, "procs", 5);
+				
+				// ceva cu icount?
+				rcu_read_unlock();
+				return NULL;
 			}
-			
-			inode->i_fop = &simple_dir_operations;
-			inode->i_op = &simple_dir_inode_operations;
-			dentry->d_fsdata = &ture[n];
-			n = (n + 1) % MAX_USERS;
-			d_add(dentry, inode);
-			
-			userfs_create_file(dir->i_sb, dentry, "procs", 5);
-			
-			// ceva cu icount?
-			rcu_read_unlock();
-			return NULL;
+		}
+		else
+		{
+			pr_err("Eroare aflare nume UID: %u\n", task_uid.val);
 		}
 		
 	}
 	rcu_read_unlock();
 	
-not_found:
 	d_add(dentry, NULL);
 	return NULL;
 }
@@ -555,4 +558,3 @@ module_exit(userfs_exit);
 MODULE_LICENSE("GPL"); /* De schimbat! */
 MODULE_DESCRIPTION("UserFS");
 MODULE_AUTHOR("Eduard Ionut Vintila");
-
