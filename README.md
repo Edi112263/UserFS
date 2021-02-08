@@ -7,5 +7,5 @@ Utilizare:
 	mkdir -p mnt
 	mount -t userfs userfs ./mnt
  
-ELiberare:
+Eliberare:
 	rmmod userfs
