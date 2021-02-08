@@ -1,2 +1,11 @@
 # UserFS
-Un pseudo-sistem de fisiere pentru a obtine utilizatorii activi din sistem si procesele asociate lor
+Compilare:
+	make
+	
+Utilizare:
+	insmod userfs.ko
+	mkdir -p mnt
+	mount -t userfs userfs ./mnt
+ 
+ELiberare:
+	rmmod userfs
