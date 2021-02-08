@@ -13,4 +13,5 @@ Utilizare:
  
 Eliberare:
 
+	umount ./mnt
 	rmmod userfs
